@@ -1,6 +1,22 @@
+from asyncore import close_all
+#from curses import COLS
+from re import A
+from typing import Dict, List, Set
 from datetime import datetime
-
+from pymysql import connect, cursors
 import requests
+
+EXTRA_PK_COLUMN: Dict[str,str] = {
+    "column_name": "KSNAME",
+    "field_name": "ksname",
+    "target_type": "DbString",
+    "upsolver_type": "string"
+}
+
+HOST = 'upsolver.csjjje3nufza.us-east-1.rds.amazonaws.com'
+USER = 'admin'
+PASSWORD = 'Upsolver1'
+INFORMATION_SCHEMA = 'information_schema'
 
 
 class ColInfo:
@@ -24,6 +40,7 @@ udt_bigint = UdtInfo('DbBigInt', 'number')
 udt_string = UdtInfo('DbString', 'string')
 udt_double = UdtInfo('DbDouble', 'number')
 udt_timestamp = UdtInfo('DbTimestamp', 'number')
+udt_bool = UdtInfo('DbBoolean', 'boolean')
 udt_map = {'int2': udt_bigint, 'int4': udt_bigint, 'int': udt_bigint, 'int8': udt_bigint, 'bigint': udt_bigint,
            'tinyint': udt_bigint, 'double': udt_double, 'smallint': udt_bigint, 'float': udt_double,
            'varchar': udt_string, 'jsonb': udt_string, 'longtext': udt_string, 'mediumtext': udt_string,
@@ -32,6 +49,7 @@ udt_map = {'int2': udt_bigint, 'int4': udt_bigint, 'int': udt_bigint, 'int8': ud
            'bool': UdtInfo('DbBoolean', 'boolean'), 'bpchar': udt_string, 'text': udt_string,
            'date': UdtInfo('DbDate', 'number'), 'money': udt_double, 'numeric': udt_double,
            'float4': udt_double, 'float8': udt_double, 'timestamp': udt_timestamp, 'time': udt_timestamp,
+           'datetime': udt_timestamp, 'bit': udt_bool,
            'timestamptz': udt_timestamp, 'char': udt_string}
 
 
@@ -60,12 +78,12 @@ def __build_template_url(api_prefix: str, output_id: str) -> str:
     return 'https://' + api_prefix + '.upsolver.com/template/' + output_id
 
 
-def __build_auth(api_token: str) -> dict[str, str]:
+def __build_auth(api_token: str) -> Dict[str, str]:
     return {'Authorization': api_token, 'Content-Type': 'application/json'}
 
 
 def add_output(api_token: str, api_prefix: str, input_id: str, full_table_name: str, logical_delete_col: str,
-               workspaces: list[str], columns_file_path: str, use_upsolver_primary_key_column: bool):
+               workspaces: List[str], columns_file_path: str, use_upsolver_primary_key_column: bool):
     """
     Create an output for a specified table.
 
@@ -100,10 +118,10 @@ def add_output(api_token: str, api_prefix: str, input_id: str, full_table_name: 
     output_id = data['id']
     template_url = __build_template_url(api_prefix, output_id)
     __filter_table(api_prefix, output_id, full_table_name, api_token)
-    info: list[ColInfo] = __get_col_info_for_table(full_table_name, columns_file_path)
+    info: List[ColInfo] = __get_col_info_for_table(full_table_name, columns_file_path)
     for col in info:
         get_first_field_time(api_prefix, input_id, full_table_name, 'data.row.' + col.name, col.upsolver_type,
-                             api_token)
+                             api_token) # TODO: use minimum last_seen to set the Output start time
         add_new_column(api_prefix, output_id, col.name, col.name, col.target_db_type, col.is_array, col.upsolver_type,
                        col.is_primary_key and not use_upsolver_primary_key_column, api_token)
 
@@ -129,11 +147,80 @@ def add_output(api_token: str, api_prefix: str, input_id: str, full_table_name: 
 
     return output_id
 
+def check_and_update_output(api_token: str, api_prefix: str, input_id: str, full_table_name: str, logical_delete_col: str,
+               workspaces: List[str], columns_file_path: str, use_upsolver_primary_key_column: bool):
+    """
+    Check an output for a specified table and return output_id, yes/no if output updated, rerun time (earliest field)
+
+    :param api_token: The API token used to authenticate with the Upsolver API
+    :param api_prefix: The prefix used for this api instance. Should be 'api' or 'api-API_GUID'
+    :param input_id: The id of the Upsolver output or data source to read from. This should be an output
+                     without any transformations on top of a CDC data source
+    :param full_table_name: The full name of the table, including the schema. This should match the data.full_table_name
+                            field contents
+    :param logical_delete_col: The column name to use if we're doing logical deletes. Set to '' otherwise
+    :param workspaces: The list of workspaces to attach to the generated output
+    :param columns_file_path: Path to the file that contains the column metadata. The file should contain a csv with triples
+                              full_table_name,column_name,udt_name,is_primary_key
+    :param use_upsolver_primary_key_column Add an UPSOLVER_PRIMARY_KEY column to each table, instead of using the normal
+                                           columns as primary keys.
+    """
+    # query existing outputs based on full_table_name
+    print("Retrieve output for " + full_table_name)
+    output_url: str = 'https://' + api_prefix + '.upsolver.com/template/?clazz=OutputTemplate'
+
+    response = get_request(output_url, api_token)
+    output_data: List[Dict[str, any]] = response.json()
+    output = next(
+        item for item in output_data if
+        item["displayData"]['name'] == full_table_name and item["status"]['clazz'] == 'Running')
+
+    output_id: str = output['id']
+
+    info: List[ColInfo] = __get_col_info_for_table(full_table_name, columns_file_path)
+    earliestRunTime = None
+    outputCols = getExistingOutputCols(api_token,api_prefix,output_id)
+    isMissingColumns = False
+    for col in info:
+        if col.name.upper() not in outputCols:
+
+            first_seen = get_first_field_time(api_prefix, input_id, full_table_name, 'data.row.' + col.name, col.upsolver_type,
+                             api_token) 
+            edit_url = 'https://' + api_prefix + '.upsolver.com/template/edit/' + output_id
+            print("Editing the output")
+            response = post_request(edit_url, api_token, None)
+            data = response.json()
+            edit_output_id = data['id']
+            add_new_column(api_prefix, edit_output_id, col.name, col.name, col.target_db_type, col.is_array, col.upsolver_type,
+                       False, api_token)
+            
+            if earliestRunTime is None or first_seen < earliestRunTime:
+                earliestRunTime = first_seen
+            isMissingColumns = True
+
+
+    return edit_output_id,isMissingColumns,earliestRunTime
+
+
+def getExistingOutputCols(api_token,api_prefix,output_id):
+
+    col_ouput_url: str = 'https://' + api_prefix + '.upsolver.com/inspection/output/inspect/fields/v2/' + output_id 
+
+    print("Getting existing col list from output")
+    response = get_request(col_ouput_url, api_token)
+    data = response.json()
+    cols = []
+    for fields in data["fields"]:
+        cols.append(fields["field"]['name'])
+    return cols
+
+
 
 def set_upsert_key(api_prefix: str, output_id: str, field_name: str, api_token: str):
     print("Setting upsert key: " + field_name)
     patch_request(__build_template_url(api_prefix, output_id), api_token,
                   json={"clazz": "ToggleUpsertKey", "name": field_name.upper()})
+
 
 
 def add_column_to_existing_output(api_prefix: str, output_id: str, column_name: str,
@@ -177,7 +264,8 @@ def get_first_field_time(api_prefix: str, input_id: str, full_table_name: str,
     print("Getting field start time for " + field_name)
     response = get_request(distr_url, api_token)
     data = response.json()
-    first_seen = datetime.strptime(data["seen"]["first"], '%Y-%m-%dT%H:%M:%S%z')
+    first_seen = datetime.strptime(data["seen"]["first"] if data.get("seen") else data.get("lastUpdate"),
+                                   '%Y-%m-%dT%H:%M:%S%z') # TODO: fails for columns with no data. We should use get() or something similar
     print("First seen time for " + field_name + ": " + first_seen.strftime('%Y-%m-%dT%H:%M:%S%z'))
     return first_seen
 
@@ -217,21 +305,32 @@ def __add_column(api_prefix: str, output_id: str, name: str, db_type: str, is_ar
         print(data)
 
 
-def __get_col_info_for_table(table, columns_file_path) -> list[ColInfo]:
+def __get_col_info_for_table(table, columns_file_path) -> List[ColInfo]:
     # conn = psycopg2.connect(database=pgDb,user=pgUser,password=pgPwd,host=pgHost,port=pgPort)
     # sql = "SELECT table_name, column_name,udt_name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '" + table + "'"
     # cur = conn.cursor()
     # cur.execute(sql)
+    schema = table.split('.')[0]
+    conn = connect(host=HOST,
+                   user=USER,
+                   password=PASSWORD,
+                   database=INFORMATION_SCHEMA,
+                   cursorclass=cursors.DictCursor)
+    sql = f"SELECT CONCAT(table_schema, '.', table_name) as table_name, column_name, data_type, CASE WHEN column_key = 'PRI' THEN 'true' else 'false' end as is_primary_key FROM information_schema.columns c WHERE TABLE_SCHEMA = '{schema}' and CONCAT(table_schema, '.', table_name) = '{table}' ORDER BY ordinal_position"
+    with conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            cur = cursor.fetchall()
 
-    cur = open(columns_file_path).readlines()
+    # cur = open(columns_file_path).readlines()
     table_columns = {}
     for row in cur:
-        col = row.strip().split(',')
-        found_table = col[0]
+        # col = row.strip().split(',')
+        found_table = row["table_name"]
         if found_table == table:
-            name = col[1]
-            udt_name = col[2]
-            is_primary_key = col[3].lower() == 'true'
+            name = row["COLUMN_NAME"]
+            udt_name = row["DATA_TYPE"]
+            is_primary_key = row["is_primary_key"].lower() == 'true'
             if table not in table_columns:
                 table_columns[table] = []
             col_dict: ColInfo = __return_field_details(name, udt_name, is_primary_key)
@@ -343,14 +442,19 @@ def run_output(api_prefix: str, output_id: str, table_name: str, jdbc_connection
                            "computeEnvironment": compute_environment,
                            "outputInterval": output_interval,
                            "startExecutionFrom": {"clazz": start_class}, "run": True})
+
+                           
     else:
         print(response.json())
+
+        
+
 
 
 def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, snowflake_connection_name: str,
                    snowflake_catalog: str, snowflake_schema: str, cloud_storage_connection_name: str,
                    compute_cluster_name: str, columns_file_path: str, output_interval: int, logical_deletes: bool,
-                   tables_include_list: set[str], tables_exclude_list: set[str]):
+                   tables_include_list: Set[str], tables_exclude_list: Set[str]):
     """
     Create and run outputs for all the tables that exist in the CDC data source, but aren't being written to Snowflake.
 
@@ -373,14 +477,14 @@ def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, s
 
     output_url: str = 'https://' + api_prefix + '.upsolver.com/template/?clazz=OutputTemplate'
     input_url: str = 'https://' + api_prefix + '.upsolver.com/inputs/'
-    conn_url: str = 'https://' + api_prefix + '.upsolver.com/connections/uses'
+    conn_url: str = 'https://' + api_prefix + '.upsolver.com/connections/uses' # TODO: replace url to connections/ and remove permissions to lookup-table:view:list
     dashboard_url: str = 'https://' + api_prefix + '.upsolver.com/environments/dashboard'
 
     full_table_name_field: str = "data.full_table_name"
 
     print("Getting the compute environment id")
     response = get_request(dashboard_url, api_token)
-    data: list[dict[str, any]] = response.json()
+    data: List[Dict[str, any]] = response.json()
     compute_environment: str = \
         next(item for item in data if item['environment']['environmentType'] == 'compute' and
              item['environment']['displayData']['name'] == compute_cluster_name)['environment']['id']
@@ -403,12 +507,12 @@ def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, s
     # get S3 bucket for athena output
     print("Getting outputs")
     response = get_request(output_url, api_token)
-    output_data: list[dict[str, any]] = response.json()
-    existing_outputs: set[str] = {item["displayData"]['name'] for item in output_data if
+    output_data: List[Dict[str, any]] = response.json()
+    existing_outputs: Set[str] = {item["displayData"]['name'] for item in output_data if
                                   item["isRunning"] or not item["deployedEver"]}
 
     response = get_request(input_url, api_token)
-    input_data: list[dict[str, any]] = response.json()
+    input_data: List[Dict[str, any]] = response.json()
     output = next(
         item for item in input_data if
         item["displayData"]['name'] == cdc_data_source_name and item["status"]['clazz'] == 'Running')
@@ -422,8 +526,8 @@ def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, s
     # query to see if any new tables
     print("Getting table list from value distribution")
     response = get_request(distr_url, api_token)
-    data: dict[str, any] = response.json()
-    distr = (data['distribution'])
+    data: Dict[str, any] = response.json()
+    distr = (data['distribution']) # TODO: Only creates outputs that have data. So new tables without data won't be created. Should we change this ?
     if logical_deletes:
         delete_key = 'is_deleted'
     else:
@@ -432,6 +536,9 @@ def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, s
     for table in distr:
         full_table_name: str = table['value']
 
+       
+
+
         if full_table_name in existing_outputs or full_table_name in tables_exclude_list or \
                 (len(tables_include_list) > 0 and full_table_name not in tables_include_list):
             print(full_table_name + " will not be processed. It either already exists, is in the exclude list, " +
@@ -439,9 +546,119 @@ def add_new_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, s
         else:
             output_id = add_output(api_token, api_prefix, ds_id, full_table_name,
                                    delete_key, workspaces, columns_file_path, False)
+            if EXTRA_PK_COLUMN.get("column_name"):
+                add_new_column(api_prefix=api_prefix, output_id=output_id, is_array=False, is_primary_key=True,
+                               api_token=api_token, **EXTRA_PK_COLUMN)
             print("output: " + output_id)
             # run output
             table_name = full_table_name.split('.')[-1]
             run_output(api_prefix, output_id, table_name, jdbc_connection,
                        snowflake_catalog, snowflake_schema, cloud_storage_connection, api_token,
                        compute_environment, output_interval)
+
+
+def update_existing_tables(api_token: str, api_prefix: str, cdc_data_source_name: str, snowflake_connection_name: str,
+                   snowflake_catalog: str, snowflake_schema: str, cloud_storage_connection_name: str,
+                   compute_cluster_name: str, columns_file_path: str, output_interval: int, logical_deletes: bool,
+                   tables_include_list: Set[str], tables_exclude_list: Set[str]):
+    """
+    Check all the tables that exist in the CDC data source, and if there are new fields that dont exist in SnowFlake add
+    to existing output and rerun.
+
+    :param api_token: The API token used to authenticate with the Upsolver API
+    :param api_prefix: The prefix of the specific API server. Should be either "api", "api-GUID" or "api-private-GUID"
+    :param cdc_data_source_name: The CDC data source name to read data from
+    :param snowflake_connection_name: The name of the Snowflake connection to use to write data
+    :param snowflake_catalog: The name of the catalog in Snowflake to write to
+    :param snowflake_schema: The name of the schema in Snowflake to write to
+    :param cloud_storage_connection_name: The name of the cloud storage connection to use as a staging bucket
+    :param compute_cluster_name: The name of the compute cluster the created outputs should run on
+    :param columns_file_path: The local path to the file that contains the list of columns per table. This file should
+                              be in the format full_table_name,column_name,column_type,is_primary_key
+    :param output_interval: The amount of minutes between writes to Snowflake
+    :param logical_deletes: If the tables created should actually delete based on deletes in the source, or just add
+                            an is_deleted column
+    :param tables_include_list: A set of full table names to include, out of the list of all the tables in the source.
+    :param tables_exclude_list: A set of full table names to exclude.
+    """
+
+    output_url: str = 'https://' + api_prefix + '.upsolver.com/template/?clazz=OutputTemplate'
+    input_url: str = 'https://' + api_prefix + '.upsolver.com/inputs/'
+    conn_url: str = 'https://' + api_prefix + '.upsolver.com/connections/uses' # TODO: replace url to connections/ and remove permissions to lookup-table:view:list
+    dashboard_url: str = 'https://' + api_prefix + '.upsolver.com/environments/dashboard'
+
+    full_table_name_field: str = "data.full_table_name"
+
+    print("Getting the compute environment id")
+    response = get_request(dashboard_url, api_token)
+    data: List[Dict[str, any]] = response.json()
+    compute_environment: str = \
+        next(item for item in data if item['environment']['environmentType'] == 'compute' and
+             item['environment']['displayData']['name'] == compute_cluster_name)['environment']['id']
+
+    print("Getting connection ids")
+    response = get_request(conn_url, api_token)
+    data = response.json()
+    item = next(item for item in data if
+                item['info']['connection']['clazz'] == 'SnowflakeConnection' and
+                item['info']['connection']['displayData']['name'] == snowflake_connection_name)
+    jdbc_connection = item['info']['id']
+    print("jdbcConnection: " + jdbc_connection)
+
+    item = next(item for item in data if
+                item['info']['connection']['clazz'] == 'S3Connection' and item['info']['connection'][
+                    'displayData']['name'] == cloud_storage_connection_name)
+    cloud_storage_connection = item['info']['id']
+    print("cloudStorageConnection: " + cloud_storage_connection)
+
+    # get S3 bucket for athena output
+    print("Getting outputs")
+    response = get_request(output_url, api_token)
+    output_data: List[Dict[str, any]] = response.json()
+    existing_outputs: Set[str] = {item["displayData"]['name'] for item in output_data if
+                                  item["isRunning"] or not item["deployedEver"]}
+
+    response = get_request(input_url, api_token)
+    input_data: List[Dict[str, any]] = response.json()
+    output = next(
+        item for item in input_data if
+        item["displayData"]['name'] == cdc_data_source_name and item["status"]['clazz'] == 'Running')
+    ds_id: str = output['id']
+    distr_url: str = 'https://' + api_prefix + '.upsolver.com/inspection/input/field/' + ds_id + '/' + \
+                     full_table_name_field + '/string?onlyDistributions=true&distribution.take=100000'
+
+    # copy the workspaces from the output
+    workspaces = output['workspaces']
+
+    # query to see if any new tables
+    print("Getting table list from value distribution")
+    response = get_request(distr_url, api_token)
+    data: Dict[str, any] = response.json()
+    distr = (data['distribution']) # TODO: Only creates outputs that have data. So new tables without data won't be created. Should we change this ?
+    if logical_deletes:
+        delete_key = 'is_deleted'
+    else:
+        delete_key = ''
+
+    for table in distr:
+        full_table_name: str = table['value']
+
+        if full_table_name in existing_outputs :
+            print(full_table_name + " will be checked for existing columns.")
+            result= check_and_update_output(api_token, api_prefix, ds_id, full_table_name,
+                                   delete_key, workspaces, columns_file_path, False)
+            output_id = result[0]
+            rerun = result[1]
+            first_seen = result[2].strftime("%Y-%m-%dT%H:%M:%SZ")
+            print("output: " + output_id + " rerun: " + str(rerun) + " first_seen: " + first_seen)
+            # run output if rerun is true
+            if rerun:
+                deploy_url = 'https://' + api_prefix + '.upsolver.com/template/deploy/' + output_id + '?force=true'
+    
+                post_request(deploy_url, api_token, json={"clazz": "OutputTemplateDeployParameters",
+                                              "computeEnvironment": compute_environment,
+                                              "outputInterval": output_interval,
+                                              "startExecutionFrom": {"clazz": "AtTime", "time": first_seen},
+                                              "run": True})
+
+
