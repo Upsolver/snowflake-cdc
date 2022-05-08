@@ -18,8 +18,8 @@ EXTRA_PK_COLUMN: Dict[str,str] = {
 # }
 
 HOST = 'upsolver.csjjje3nufza.us-east-1.rds.amazonaws.com'
-USER = 'admin'
-PASSWORD = 'Upsolver1'
+USER = ''
+PASSWORD = ''
 INFORMATION_SCHEMA = 'information_schema'
 
 
