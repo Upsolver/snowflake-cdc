@@ -2,20 +2,24 @@ from asyncore import close_all
 #from curses import COLS
 from re import A
 from typing import Dict, List, Set
-from datetime import datetime
+from datetime import datetime,timedelta
 from pymysql import connect, cursors
 import requests
 
 EXTRA_PK_COLUMN: Dict[str,str] = {
-    "column_name": "KSNAME",
-    "field_name": "ksname",
-    "target_type": "DbString",
-    "upsolver_type": "string"
+    
 }
 
+# EXTRA_PK_COLUMN: Dict[str,str] = {
+#     "column_name": "KSNAME",
+#     "field_name": "ksname",
+#     "target_type": "DbString",
+#     "upsolver_type": "string"
+# }
+
 HOST = 'upsolver.csjjje3nufza.us-east-1.rds.amazonaws.com'
-USER = ''
-PASSWORD = ''
+USER = 'admin'
+PASSWORD = 'Upsolver1'
 INFORMATION_SCHEMA = 'information_schema'
 
 
@@ -107,7 +111,7 @@ def add_output(api_token: str, api_prefix: str, input_id: str, full_table_name: 
                                   "displayData": {"name": full_table_name, "description": ""},
                                   "inputs": [input_id],
                                   "outputParameters": {"clazz": "SnowflakeOutputParameters",
-                                                       "shouldFlatten": False,
+                                                       "shouldFlatten": True,
                                                        "failOnWriteError": True,
                                                        "selectedOutputType": "SnowflakeOutputParameters",
                                                        "createTable": True}, "groupBy": False,
@@ -649,8 +653,9 @@ def update_existing_tables(api_token: str, api_prefix: str, cdc_data_source_name
                                    delete_key, workspaces, columns_file_path, False)
             output_id = result[0]
             rerun = result[1]
-            first_seen = result[2].strftime("%Y-%m-%dT%H:%M:%SZ")
-            print("output: " + output_id + " rerun: " + str(rerun) + " first_seen: " + first_seen)
+            rerun_time = (result[2] - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            print("output: " + output_id + " rerun: " + str(rerun) +  " rerun from: " + rerun_time)
             # run output if rerun is true
             if rerun:
                 deploy_url = 'https://' + api_prefix + '.upsolver.com/template/deploy/' + output_id + '?force=true'
@@ -658,7 +663,7 @@ def update_existing_tables(api_token: str, api_prefix: str, cdc_data_source_name
                 post_request(deploy_url, api_token, json={"clazz": "OutputTemplateDeployParameters",
                                               "computeEnvironment": compute_environment,
                                               "outputInterval": output_interval,
-                                              "startExecutionFrom": {"clazz": "AtTime", "time": first_seen},
+                                              "startExecutionFrom": {"clazz": "AtTime", "time": rerun_time},
                                               "run": True})
 
 
